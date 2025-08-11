@@ -42,7 +42,19 @@ def _best_from_srcset(srcset):
     items.sort(key=lambda x: x[0], reverse=True)
     return items[0][1]
 
-# ---------------- AllRecipes (unchanged) ----------------
+def _to_float(txt) -> float | None:
+    if txt is None:
+        return None
+    try:
+        # keep only first number like 4.7, 4, 4,200 etc.
+        m = re.search(r"(\d+(?:[.,]\d+)?)", str(txt))
+        if not m:
+            return None
+        return float(m.group(1).replace(",", "."))
+    except:
+        return None
+
+# ---------------- AllRecipes (unchanged + rating) ----------------
 def scrape_allrecipes(soup: BeautifulSoup) -> dict:
     title_tag = soup.find("h1")
     title = title_tag.get_text(strip=True) if title_tag else "Untitled"
@@ -85,6 +97,38 @@ def scrape_allrecipes(soup: BeautifulSoup) -> dict:
     if og and og.get("content"):
         image_url = og["content"]
 
+    # ⭐ Rating (JSON-LD first, then HTML fallback)
+    rating = None
+    try:
+        for sc in soup.find_all("script", type="application/ld+json"):
+            txt = sc.string or sc.get_text()
+            if not txt:
+                continue
+            data = json.loads(txt)
+            nodes = []
+            if isinstance(data, dict):
+                nodes.append(data)
+                if isinstance(data.get("@graph"), list):
+                    nodes += data["@graph"]
+            elif isinstance(data, list):
+                nodes = data
+            for node in nodes:
+                if isinstance(node, dict) and (node.get("@type") == "Recipe" or "recipe" in [str(x).lower() for x in (node.get("@type") if isinstance(node.get("@type"), list) else [node.get("@type")])]):
+                    agg = node.get("aggregateRating")
+                    if isinstance(agg, dict):
+                        rating = _to_float(agg.get("ratingValue"))
+                        if rating:
+                            break
+            if rating:
+                break
+    except:
+        pass
+    if rating is None:
+        # HTML fallback div.mm-recipes-review-bar__rating ...
+        rt = soup.find("div", class_=lambda c: c and "mm-recipes-review-bar__rating" in c)
+        if rt:
+            rating = _to_float(rt.get_text())
+
     return {
         "title": title,
         "notes": notes,
@@ -92,7 +136,8 @@ def scrape_allrecipes(soup: BeautifulSoup) -> dict:
         "instructions": instructions,
         "cooking_time": cooking_time,
         "servings": servings,
-        "image_url": image_url
+        "image_url": image_url,
+        "rating": rating,
     }
 
 # ---------------- FoodNetwork UK ----------------
@@ -110,7 +155,7 @@ def _html_str_to_steps(html_str: str):
 def _parse_fnuk_jsonld(soup: BeautifulSoup) -> dict:
     out = {
         "title": None, "notes": None, "ingredients": [], "instructions": [],
-        "cooking_time": None, "servings": None, "image_url": None
+        "cooking_time": None, "servings": None, "image_url": None, "rating": None
     }
     scripts = soup.find_all("script", type="application/ld+json")
     for sc in scripts:
@@ -181,6 +226,11 @@ def _parse_fnuk_jsonld(soup: BeautifulSoup) -> dict:
             if ry:
                 out["servings"] = out["servings"] or clean(str(ry))
 
+            # ⭐ rating from JSON-LD
+            agg = node.get("aggregateRating")
+            if isinstance(agg, dict):
+                out["rating"] = _to_float(agg.get("ratingValue"))
+
             return out  # first Recipe is enough
     return out
 
@@ -246,6 +296,30 @@ def _fnuk_html_fallbacks(soup: BeautifulSoup, raw_html: str) -> dict:
         if m2:
             servings = m2.group(1)
 
+    rating = None
+
+    # 1) Try schema-ish
+    rv = soup.select_one('[itemprop="ratingValue"]')
+    if rv:
+        rating = _to_float(rv.get_text() or rv.get("content"))
+
+    # 2) Try exact Tailwind class combo (need to escape brackets)
+    if rating is None:
+        cand = soup.select_one('div.font-\\[700\\].text-\\[14px\\].text-white')
+        if cand:
+            val = _to_float(cand.get_text())
+            if val is not None and 0 < val <= 5:
+                rating = val
+
+    # 3) Broader fallback: any div with class "font-[700]" (regex),
+    #    keep the first number that looks like a 0–5 rating.
+    if rating is None:
+        for div in soup.find_all('div', class_=re.compile(r'(^|\s)font-\[700\](\s|$)')):
+            val = _to_float(div.get_text())
+            if val is not None and 0 < val <= 5:
+                rating = val
+                break
+
     return {
         "title": title or None,
         "notes": notes or None,
@@ -254,13 +328,15 @@ def _fnuk_html_fallbacks(soup: BeautifulSoup, raw_html: str) -> dict:
         "cooking_time": cooking_time or None,
         "servings": servings or None,
         "image_url": image_url or None,
+        "rating": rating,
     }
 
 def scrape_foodnetwork_uk(soup: BeautifulSoup, raw_html: str) -> dict:
-    ld   = _parse_fnuk_jsonld(soup)               # ingredients/instructions/time (ISO) if present
-    html = _fnuk_html_fallbacks(soup, raw_html)   # title/notes/image/time(short)/servings
+    ld   = _parse_fnuk_jsonld(soup)               # ingredients/instructions/time (ISO) and rating if present
+    html = _fnuk_html_fallbacks(soup, raw_html)   # title/notes/image/time(short)/servings and rating fallback
 
     cooking_time = html["cooking_time"] or iso_duration_to_short(ld["cooking_time"])
+    rating = ld["rating"] if ld["rating"] is not None else html["rating"]
 
     return {
         "title": html["title"] or ld["title"] or "Untitled",
@@ -270,6 +346,7 @@ def scrape_foodnetwork_uk(soup: BeautifulSoup, raw_html: str) -> dict:
         "cooking_time": cooking_time,
         "servings": html["servings"] or ld["servings"],
         "image_url": html["image_url"] or ld["image_url"],
+        "rating": rating,
     }
 
 # ---------------- Router ----------------
