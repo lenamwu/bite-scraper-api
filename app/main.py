@@ -3,6 +3,8 @@ from pydantic import BaseModel
 from bs4 import BeautifulSoup
 import requests, json, re
 from urllib.parse import urlparse
+import asyncio
+import aiohttp
 
 app = FastAPI()
 
@@ -53,6 +55,43 @@ def _to_float(txt) -> float | None:
         return float(m.group(1).replace(",", "."))
     except:
         return None
+
+async def validate_image_url(image_url: str) -> bool:
+    """Test if an image URL is accessible through the weserv.nl proxy"""
+    if not image_url:
+        return False
+    
+    # Test the image URL through your proxy service
+    proxy_url = f"https://images.weserv.nl/?url={image_url}"
+    
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.head(proxy_url) as response:
+                # Check if the response is successful and is an image
+                if response.status == 200:
+                    content_type = response.headers.get('content-type', '').lower()
+                    return content_type.startswith('image/')
+                return False
+    except Exception:
+        return False
+
+async def validate_recipe_data(recipe_data: dict) -> dict:
+    """Validate recipe data and ensure image is accessible"""
+    # Check if image URL is valid and accessible
+    if recipe_data.get("image_url"):
+        is_valid_image = await validate_image_url(recipe_data["image_url"])
+        if not is_valid_image:
+            # If image is not accessible, remove it
+            recipe_data["image_url"] = None
+    
+    # If no valid image found, raise an error to filter out this recipe
+    if not recipe_data.get("image_url"):
+        raise HTTPException(
+            status_code=422, 
+            detail="Recipe has no accessible image and cannot be displayed in search results"
+        )
+    
+    return recipe_data
 
 # ---------------- AllRecipes (rewritten from scratch) ----------------
 def scrape_allrecipes(soup: BeautifulSoup) -> dict:
@@ -1027,7 +1066,7 @@ def scrape_food_com(soup: BeautifulSoup) -> dict:
 
 # ---------------- Router ----------------
 @app.post("/api/parseRecipe")
-def parse_recipe(data: RecipeRequest):
+async def parse_recipe(data: RecipeRequest):
     try:
         url = data.url if data.url.startswith("http") else f"https://{data.url}"
         domain = urlparse(url).netloc.lower()
@@ -1038,16 +1077,21 @@ def parse_recipe(data: RecipeRequest):
 
         soup = BeautifulSoup(resp.content, "html.parser")
 
+        # Scrape recipe data based on domain
         if "food.com" in domain:
-            return scrape_food_com(soup)
+            recipe_data = scrape_food_com(soup)
         elif "thetableofspice.com" in domain:
-            return scrape_tableofspice(soup)
+            recipe_data = scrape_tableofspice(soup)
         elif "foodnetwork.co.uk" in domain:
-            return scrape_foodnetwork_uk(soup, resp.text)  # pass RAW HTML here
+            recipe_data = scrape_foodnetwork_uk(soup, resp.text)  # pass RAW HTML here
         elif "allrecipes.com" in domain:
-            return scrape_allrecipes(soup)
+            recipe_data = scrape_allrecipes(soup)
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported domain: {domain}")
+
+        # Validate recipe data and ensure image is accessible
+        validated_recipe = await validate_recipe_data(recipe_data)
+        return validated_recipe
 
     except HTTPException:
         raise
