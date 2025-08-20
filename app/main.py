@@ -110,18 +110,39 @@ def scrape_allrecipes(soup: BeautifulSoup) -> dict:
     if title_tag:
         title = clean(title_tag.get_text())
 
-    # Extract description/notes - look for recipe description
+    # Extract description/notes - look for recipe description with improved targeting
     desc_selectors = [
         "p.article-subheading",
         ".recipe-summary p",
         ".entry-content p:first-of-type",
-        "div[data-module='RecipeSummary'] p"
+        "div[data-module='RecipeSummary'] p",
+        ".recipe-description",
+        ".recipe-intro p"
     ]
+    
+    # First try to find description in the main content area
     for selector in desc_selectors:
         desc_tag = soup.select_one(selector)
         if desc_tag:
             notes = clean(desc_tag.get_text())
             break
+    
+    # If not found, look for the first substantial paragraph after the title
+    if not notes:
+        # Find all paragraphs and look for the first one that looks like a description
+        all_paragraphs = soup.find_all("p")
+        for p in all_paragraphs:
+            text = clean(p.get_text())
+            if (text and len(text) > 50 and  # Must be substantial
+                not any(skip in text.lower() for skip in 
+                       ["photo", "credit", "advertisement", "subscribe", "newsletter", "follow",
+                        "save", "print", "share", "rate", "review", "comment"]) and
+                # Should contain recipe-related words
+                any(word in text.lower() for word in 
+                    ["recipe", "dish", "delicious", "flavor", "taste", "cook", "make", "best",
+                     "perfect", "easy", "simple", "ingredients", "this", "it's", "you'll"])):
+                notes = text
+                break
 
     # Try JSON-LD first for ingredients (most reliable)
     try:
@@ -161,80 +182,92 @@ def scrape_allrecipes(soup: BeautifulSoup) -> dict:
     except Exception:
         pass
 
-    # If JSON-LD didn't work, try HTML extraction with very specific targeting
+    # If JSON-LD didn't work, try HTML extraction with improved targeting
     if not ingredients:
-        # Look for lists that contain ingredient-like items (with measurements)
-        all_lists = soup.find_all("ul")
-        for ul in all_lists:
-            # Skip navigation and menu lists by checking classes and parent context
-            ul_classes = " ".join(ul.get("class", [])).lower()
-            ul_parent_classes = " ".join(ul.parent.get("class", [])).lower() if ul.parent else ""
-            ul_context = (ul_classes + " " + ul_parent_classes)
-            
-            # Skip obvious navigation/menu elements
-            if any(skip_word in ul_context for skip_word in 
-                   ["nav", "menu", "header", "footer", "sidebar", "breadcrumb", "dropdown", "global", "primary"]):
-                continue
-            
-            list_items = ul.find_all("li")
-            if len(list_items) < 2:  # Need at least 2 items
-                continue
-                
-            # Check if this list contains ingredient-like items
-            ingredient_like_count = 0
+        # First try to find ingredients in the structured ingredients section
+        ingredient_selectors = [
+            "ul li",  # Generic list items
+            ".recipe-ingredients li",
+            ".ingredients-section li",
+            "[data-ingredient] span",
+            ".mntl-structured-ingredients__list-item"
+        ]
+        
+        for selector in ingredient_selectors:
+            ingredient_items = soup.select(selector)
             potential_ingredients = []
-            navigation_words = {"chicken", "beef", "pork", "seafood", "pasta", "fruits", "vegetables", "view all", "recipes", "browse", "categories", "appetizers", "desserts", "main dishes"}
             
-            for item in list_items:
+            for item in ingredient_items:
                 text = clean(item.get_text())
                 if not text or len(text) < 3:
                     continue
                 
-                # Skip obvious navigation items
-                if text.lower() in navigation_words:
+                # Skip navigation and non-ingredient items
+                if any(skip_word in text.lower() for skip_word in 
+                       ["recipe", "photo", "view", "more", "sign", "follow", "advertisement", 
+                        "navigation", "menu", "search", "subscribe", "newsletter"]):
                     continue
                 
-                # Check if it looks like an ingredient
+                # Look for measurement indicators or food items
                 has_measurement = any(word in text.lower() for word in 
                     ["cup", "cups", "teaspoon", "teaspoons", "tablespoon", "tablespoons", 
                      "pound", "pounds", "ounce", "ounces", "gram", "grams", "ml", "liter", 
                      "tsp", "tbsp", "lb", "lbs", "oz", "clove", "cloves", "slice", "slices", 
-                     "piece", "pieces", "inch", "inches", "½", "¼", "¾", "1/2", "1/4", "3/4"])
+                     "piece", "pieces", "inch", "inches", "½", "¼", "¾", "1/2", "1/4", "3/4",
+                     "large", "medium", "small", "pinch", "dash"])
                 
-                has_number = bool(re.search(r'\d', text))
+                has_number = bool(re.search(r'[\d¼½¾⅓⅔⅛⅜⅝⅞]', text))
                 
-                if has_measurement or has_number:
-                    ingredient_like_count += 1
-                    potential_ingredients.append(text)
-                elif len(potential_ingredients) == 0:  # First item might not have measurement
+                # Check if it contains common ingredient words
+                has_ingredient_word = any(word in text.lower() for word in 
+                    ["flour", "sugar", "salt", "pepper", "oil", "butter", "milk", "egg", "eggs",
+                     "vanilla", "cinnamon", "bread", "cheese", "onion", "garlic", "water"])
+                
+                if has_measurement or has_number or has_ingredient_word:
                     potential_ingredients.append(text)
             
-            # If most items look like ingredients, use this list
-            if ingredient_like_count >= 2 and ingredient_like_count >= len(list_items) * 0.5:
+            # If we found a reasonable number of ingredients, use them
+            if len(potential_ingredients) >= 3:
                 ingredients = potential_ingredients
                 break
 
-    # Extract instructions - look for instruction steps
-    instruction_selectors = [
-        "li[data-instruction] p",
-        "ol.comp.mntl-sc-block-group--OL li p",
-        ".recipe-instructions li p",
-        ".instructions-section li p"
-    ]
-    
-    for selector in instruction_selectors:
-        instruction_items = soup.select(selector)
-        if instruction_items:
+    # Extract instructions with improved targeting
+    if not instructions:
+        instruction_selectors = [
+            "ol li",  # Ordered list items (most common for instructions)
+            ".recipe-instructions li",
+            ".instructions-section li",
+            ".directions li",
+            ".method li",
+            ".recipe-directions li"
+        ]
+        
+        for selector in instruction_selectors:
+            instruction_items = soup.select(selector)
+            potential_instructions = []
+            
             for item in instruction_items:
-                step_text = clean(item.get_text())
+                text = clean(item.get_text())
+                if not text or len(text) < 10:  # Instructions should be longer
+                    continue
                 
-                # Filter out photo credits and attribution text
-                if step_text and not any(credit in step_text.lower() for credit in [
-                    "allrecipes /", "dotdash meredith", "food studios", 
-                    "photo by", "credit:", "image by", "© "
-                ]):
-                    instructions.append(step_text)
-            break
+                # Skip ingredient-like items and navigation
+                if any(skip_word in text.lower() for skip_word in 
+                       ["cup", "teaspoon", "tablespoon", "ounce", "pound", "recipe", "photo", "view",
+                        "navigation", "menu", "advertisement", "subscribe"]):
+                    continue
+                
+                # Look for instruction-like content
+                if any(action in text.lower() for action in 
+                       ["heat", "cook", "bake", "mix", "stir", "add", "combine", "place", "pour", 
+                        "cover", "simmer", "boil", "fry", "saute", "preheat", "spray", "season",
+                        "whisk", "blend", "chop", "slice", "dice", "melt", "serve", "remove",
+                        "gather", "measure", "soak", "working"]):
+                    potential_instructions.append(text)
+            
+            if len(potential_instructions) >= 2:  # Need at least 2 instruction steps
+                instructions = potential_instructions
+                break
 
     # Extract timing and servings information
     # Look for recipe details section
