@@ -231,24 +231,88 @@ def scrape_allrecipes(soup: BeautifulSoup) -> dict:
                 elif any(word in text.lower() for word in ["serving", "yield"]) and not servings:
                     servings = text
 
-    # Extract image URL
-    # Try og:image first
+    # Extract image URL - prioritize most accessible sources
+    # Try og:image first (most reliable for cross-domain access)
     og_image = soup.find("meta", property="og:image")
     if og_image and og_image.get("content"):
         image_url = og_image["content"]
-    else:
-        # Look for recipe image
+    
+    # Try twitter:image as backup
+    if not image_url:
+        twitter_image = soup.find("meta", attrs={"name": "twitter:image"})
+        if twitter_image and twitter_image.get("content"):
+            image_url = twitter_image["content"]
+    
+    # Try to find JSON-LD image (often more accessible)
+    if not image_url:
+        try:
+            for script in soup.find_all("script", type="application/ld+json"):
+                script_text = script.string or script.get_text()
+                if not script_text:
+                    continue
+                
+                try:
+                    data = json.loads(script_text)
+                    candidates = []
+                    
+                    if isinstance(data, dict):
+                        candidates.append(data)
+                        if "@graph" in data and isinstance(data["@graph"], list):
+                            candidates.extend(data["@graph"])
+                    elif isinstance(data, list):
+                        candidates.extend(data)
+                    
+                    for item in candidates:
+                        if not isinstance(item, dict):
+                            continue
+                        
+                        item_type = item.get("@type")
+                        types = [item_type] if isinstance(item_type, str) else (item_type or [])
+                        
+                        if any(str(t).lower() == "recipe" for t in types):
+                            img = item.get("image")
+                            if isinstance(img, str):
+                                image_url = img
+                                break
+                            elif isinstance(img, list) and img:
+                                image_url = img[0]
+                                break
+                            elif isinstance(img, dict):
+                                image_url = img.get("url")
+                                break
+                    
+                    if image_url:
+                        break
+                except json.JSONDecodeError:
+                    continue
+        except Exception:
+            pass
+    
+    # Fallback to HTML image elements (less reliable for cross-domain)
+    if not image_url:
         img_selectors = [
             "img.primary-image",
             "img[data-src*='recipe']",
             ".recipe-image img",
-            ".hero-image img"
+            ".hero-image img",
+            "img[src*='allrecipes']"
         ]
         for selector in img_selectors:
             img_elem = soup.select_one(selector)
             if img_elem:
-                image_url = img_elem.get("src") or img_elem.get("data-src")
-                break
+                src = img_elem.get("src") or img_elem.get("data-src")
+                if src:
+                    # Clean up AllRecipes URLs - remove complex filters that might cause CORS issues
+                    if "allrecipes.com" in src and "/filters:" in src:
+                        # Try to get a simpler version of the URL
+                        base_url = src.split("/filters:")[0]
+                        if base_url:
+                            image_url = base_url
+                        else:
+                            image_url = src
+                    else:
+                        image_url = src
+                    break
 
     # Extract rating - try JSON-LD first, then HTML fallback
     try:
