@@ -703,6 +703,264 @@ def scrape_tableofspice(soup: BeautifulSoup) -> dict:
         "rating": rating,
     }
 
+# ---------------- Food.com ----------------
+def scrape_food_com(soup: BeautifulSoup) -> dict:
+    title = "Untitled"
+    notes = ""
+    ingredients = []
+    instructions = []
+    cooking_time = None
+    servings = None
+    image_url = None
+    rating = None
+
+    # Extract title
+    title_tag = soup.find("h1")
+    if title_tag:
+        title = clean(title_tag.get_text())
+
+    # Extract description/notes - look for the recipe description
+    # Food.com typically has the description in quotes after the submitter info
+    desc_selectors = [
+        'p:contains(")")',  # Look for description in quotes
+        '.recipe-description',
+        '.recipe-summary'
+    ]
+    
+    # Try to find description text in quotes
+    for p_tag in soup.find_all("p"):
+        text = clean(p_tag.get_text())
+        if text and text.startswith('"') and text.endswith('"') and len(text) > 20:
+            notes = text.strip('"')
+            break
+    
+    if not notes:
+        # Fallback to other selectors
+        for selector in desc_selectors:
+            desc_tag = soup.select_one(selector)
+            if desc_tag:
+                notes = clean(desc_tag.get_text())
+                break
+
+    # Try JSON-LD first for structured data
+    try:
+        for script in soup.find_all("script", type="application/ld+json"):
+            script_text = script.string or script.get_text()
+            if not script_text:
+                continue
+            
+            try:
+                data = json.loads(script_text)
+                candidates = []
+                
+                if isinstance(data, dict):
+                    candidates.append(data)
+                    if "@graph" in data and isinstance(data["@graph"], list):
+                        candidates.extend(data["@graph"])
+                elif isinstance(data, list):
+                    candidates.extend(data)
+                
+                for item in candidates:
+                    if not isinstance(item, dict):
+                        continue
+                    
+                    item_type = item.get("@type")
+                    types = [item_type] if isinstance(item_type, str) else (item_type or [])
+                    
+                    if any(str(t).lower() == "recipe" for t in types):
+                        # Extract from JSON-LD
+                        if not title or title == "Untitled":
+                            title = clean(item.get("name")) or title
+                        
+                        if not notes:
+                            notes = clean(item.get("description")) or notes
+                        
+                        # Ingredients
+                        recipe_ingredients = item.get("recipeIngredient", [])
+                        if recipe_ingredients and not ingredients:
+                            ingredients = [clean(ing) for ing in recipe_ingredients if clean(ing)]
+                        
+                        # Instructions
+                        recipe_instructions = item.get("recipeInstructions", [])
+                        if recipe_instructions and not instructions:
+                            for inst in recipe_instructions:
+                                if isinstance(inst, str):
+                                    instructions.append(clean(inst))
+                                elif isinstance(inst, dict):
+                                    text = inst.get("text") or inst.get("name") or ""
+                                    if text:
+                                        instructions.append(clean(text))
+                        
+                        # Image
+                        img = item.get("image")
+                        if isinstance(img, str):
+                            image_url = image_url or img
+                        elif isinstance(img, list) and img:
+                            image_url = image_url or img[0]
+                        elif isinstance(img, dict):
+                            image_url = image_url or img.get("url")
+                        
+                        # Times
+                        total_time = item.get("totalTime")
+                        if total_time:
+                            cooking_time = cooking_time or iso_duration_to_short(total_time)
+                        
+                        # Servings
+                        recipe_yield = item.get("recipeYield")
+                        if recipe_yield:
+                            if isinstance(recipe_yield, list):
+                                servings = servings or " ".join([clean(str(y)) for y in recipe_yield if clean(str(y))])
+                            else:
+                                servings = servings or clean(str(recipe_yield))
+                        
+                        # Rating
+                        agg_rating = item.get("aggregateRating")
+                        if isinstance(agg_rating, dict) and not rating:
+                            rating = _to_float(agg_rating.get("ratingValue"))
+                        
+                        break  # Use first recipe found
+            except json.JSONDecodeError:
+                continue
+    except Exception:
+        pass
+
+    # HTML fallbacks if JSON-LD didn't provide everything
+    if not ingredients:
+        # Look for ingredients list - Food.com uses a specific structure
+        ingredient_items = soup.select("li")
+        potential_ingredients = []
+        
+        for li in ingredient_items:
+            text = clean(li.get_text())
+            if not text or len(text) < 3:
+                continue
+            
+            # Skip navigation and non-ingredient items
+            if any(skip_word in text.lower() for skip_word in 
+                   ["recipe", "photo", "view", "more", "sign", "follow", "advertisement"]):
+                continue
+            
+            # Look for measurement indicators or food items
+            has_measurement = any(word in text.lower() for word in 
+                ["cup", "cups", "teaspoon", "teaspoons", "tablespoon", "tablespoons", 
+                 "pound", "pounds", "ounce", "ounces", "gram", "grams", "ml", "liter", 
+                 "tsp", "tbsp", "lb", "lbs", "oz", "clove", "cloves", "slice", "slices", 
+                 "piece", "pieces", "inch", "inches", "½", "¼", "¾", "1/2", "1/4", "3/4",
+                 "can", "package", "frozen", "fresh"])
+            
+            has_number = bool(re.search(r'\d', text))
+            
+            # Food.com specific patterns
+            has_food_link = li.find("a", href=lambda x: x and "/about/" in x)
+            
+            if has_measurement or has_number or has_food_link:
+                potential_ingredients.append(text)
+        
+        # If we found a reasonable number of ingredients, use them
+        if len(potential_ingredients) >= 3:
+            ingredients = potential_ingredients
+
+    # Extract instructions if not found in JSON-LD
+    if not instructions:
+        # Look for directions/instructions
+        instruction_items = soup.select("li")
+        potential_instructions = []
+        
+        for li in instruction_items:
+            text = clean(li.get_text())
+            if not text or len(text) < 10:  # Instructions should be longer
+                continue
+            
+            # Skip ingredient-like items and navigation
+            if any(skip_word in text.lower() for skip_word in 
+                   ["cup", "teaspoon", "tablespoon", "ounce", "pound", "recipe", "photo", "view"]):
+                continue
+            
+            # Look for instruction-like content
+            if any(action in text.lower() for action in 
+                   ["heat", "cook", "bake", "mix", "stir", "add", "combine", "place", "pour", 
+                    "cover", "simmer", "boil", "fry", "saute", "preheat", "spray", "season"]):
+                potential_instructions.append(text)
+        
+        if potential_instructions:
+            instructions = potential_instructions
+
+    # Extract timing and servings from visible text
+    if not cooking_time or not servings:
+        # Look for "Ready In:" and "Serves:" information
+        for text_elem in soup.find_all(text=True):
+            text = clean(str(text_elem))
+            if not text:
+                continue
+            
+            if "ready in:" in text.lower() and not cooking_time:
+                # Extract time after "Ready In:"
+                time_match = re.search(r'ready in:\s*(\d+\s*mins?)', text, re.IGNORECASE)
+                if time_match:
+                    cooking_time = time_match.group(1)
+            
+            if "serves:" in text.lower() and not servings:
+                # Extract servings after "Serves:"
+                serves_match = re.search(r'serves:\s*([0-9\-]+)', text, re.IGNORECASE)
+                if serves_match:
+                    servings = serves_match.group(1)
+
+    # Extract image URL if not found
+    if not image_url:
+        # Try og:image first (usually the most accessible)
+        og_image = soup.find("meta", property="og:image")
+        if og_image and og_image.get("content"):
+            image_url = og_image["content"]
+        
+        # If no og:image, try twitter:image
+        if not image_url:
+            twitter_image = soup.find("meta", attrs={"name": "twitter:image"})
+            if twitter_image and twitter_image.get("content"):
+                image_url = twitter_image["content"]
+        
+        # Look for the main recipe photo - Food.com has specific patterns
+        if not image_url:
+            # Try to find the main recipe image with higher resolution
+            main_img = soup.find("img", attrs={"alt": lambda x: x and "photo by" in x.lower()})
+            if main_img:
+                src = main_img.get("src")
+                if src and "sndimg.com" in src:
+                    # Try to get a higher resolution version by modifying the URL
+                    if "w_960" in src:
+                        image_url = src.replace("w_960", "w_1200")
+                    elif "w_744" in src:
+                        image_url = src.replace("w_744", "w_1200")
+                    else:
+                        image_url = src
+        
+        # Fallback to any food.com image
+        if not image_url:
+            img_selectors = [
+                "img[src*='sndimg.com']",  # Food.com's CDN
+                "img[src*='recipe']",
+                "img[src*='food']",
+                ".recipe-image img",
+                "img[alt*='photo']"
+            ]
+            for selector in img_selectors:
+                img_elem = soup.select_one(selector)
+                if img_elem:
+                    src = img_elem.get("src") or img_elem.get("data-src")
+                    if src and ("sndimg.com" in src or "food.com" in src):
+                        image_url = src
+                        break
+
+    return {
+        "title": title,
+        "notes": notes,
+        "ingredients": ingredients,
+        "instructions": instructions,
+        "cooking_time": cooking_time,
+        "servings": servings or "servings not specified",
+        "image_url": image_url,
+        "rating": rating,
+    }
+
 # ---------------- Router ----------------
 @app.post("/api/parseRecipe")
 def parse_recipe(data: RecipeRequest):
@@ -716,7 +974,9 @@ def parse_recipe(data: RecipeRequest):
 
         soup = BeautifulSoup(resp.content, "html.parser")
 
-        if "thetableofspice.com" in domain:
+        if "food.com" in domain:
+            return scrape_food_com(soup)
+        elif "thetableofspice.com" in domain:
             return scrape_tableofspice(soup)
         elif "foodnetwork.co.uk" in domain:
             return scrape_foodnetwork_uk(soup, resp.text)  # pass RAW HTML here
