@@ -1122,9 +1122,9 @@ async def parse_recipe(data: RecipeRequest):
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported domain: {domain}")
 
-        # Validate recipe data and ensure image is accessible
-        validated_recipe = await validate_recipe_data(recipe_data)
-        return validated_recipe
+        # Return recipe data without image validation
+        # (Images are handled by Google Custom Search API in the feed)
+        return recipe_data
 
     except HTTPException:
         raise
