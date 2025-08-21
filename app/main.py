@@ -54,6 +54,55 @@ def _to_float(txt) -> float | None:
     except:
         return None
 
+def clean_ingredient_decimals(ingredient: str) -> str:
+    """Clean up long decimals in ingredient text"""
+    if not ingredient:
+        return ingredient
+    
+    # Pattern to match decimals with more than 2 decimal places
+    decimal_pattern = r'\b(\d+)\.(\d{3,})\b'
+    
+    def replace_decimal(match):
+        whole = match.group(1)
+        decimal_part = match.group(2)
+        
+        # Convert to float and round to 2 decimal places
+        try:
+            number = float(f"{whole}.{decimal_part}")
+            # Round to 2 decimal places and remove trailing zeros
+            rounded = round(number, 2)
+            if rounded == int(rounded):
+                return str(int(rounded))
+            else:
+                return f"{rounded:.2f}".rstrip('0').rstrip('.')
+        except:
+            return match.group(0)  # Return original if conversion fails
+    
+    # Replace long decimals
+    cleaned = re.sub(decimal_pattern, replace_decimal, ingredient)
+    
+    # Also handle common fraction conversions
+    fraction_replacements = {
+        r'\b0\.33333+\b': '1/3',
+        r'\b0\.66666+\b': '2/3',
+        r'\b0\.25\b': '1/4',
+        r'\b0\.75\b': '3/4',
+        r'\b0\.5\b': '1/2',
+        r'\b0\.125\b': '1/8',
+        r'\b0\.375\b': '3/8',
+        r'\b0\.625\b': '5/8',
+        r'\b0\.875\b': '7/8',
+        r'\b1\.33333+\b': '1 1/3',
+        r'\b1\.66666+\b': '1 2/3',
+        r'\b2\.33333+\b': '2 1/3',
+        r'\b2\.66666+\b': '2 2/3',
+    }
+    
+    for pattern, replacement in fraction_replacements.items():
+        cleaned = re.sub(pattern, replacement, cleaned)
+    
+    return cleaned
+
 async def validate_image_url(image_url: str) -> bool:
     """Test if an image URL is accessible through the weserv.nl proxy"""
     if not image_url:
@@ -170,7 +219,7 @@ def scrape_allrecipes(soup: BeautifulSoup) -> dict:
                     if any(str(t).lower() == "recipe" for t in types):
                         recipe_ingredients = item.get("recipeIngredient", [])
                         if recipe_ingredients:
-                            ingredients = [clean(ing) for ing in recipe_ingredients if clean(ing)]
+                            ingredients = [clean_ingredient_decimals(clean(ing)) for ing in recipe_ingredients if clean(ing)]
                             break
                 
                 if ingredients:
@@ -554,7 +603,7 @@ def _parse_fnuk_jsonld(soup: BeautifulSoup) -> dict:
 
             ings = node.get("recipeIngredient") or node.get("ingredients")
             if ings:
-                out["ingredients"] = [clean(i) for i in (ings if isinstance(ings, list) else [ings]) if clean(i)]
+                out["ingredients"] = [clean_ingredient_decimals(clean(i)) for i in (ings if isinstance(ings, list) else [ings]) if clean(i)]
 
             inst = node.get("recipeInstructions")
             steps = []
@@ -773,7 +822,7 @@ def scrape_tableofspice(soup: BeautifulSoup) -> dict:
                 # Ingredients
                 recipe_ingredients = node.get("recipeIngredient", [])
                 if recipe_ingredients and not ingredients:
-                    ingredients = [clean(ing) for ing in recipe_ingredients if clean(ing)]
+                    ingredients = [clean_ingredient_decimals(clean(ing)) for ing in recipe_ingredients if clean(ing)]
                 
                 # Instructions
                 recipe_instructions = node.get("recipeInstructions", [])
@@ -963,7 +1012,7 @@ def scrape_food_com(soup: BeautifulSoup) -> dict:
                         # Ingredients
                         recipe_ingredients = item.get("recipeIngredient", [])
                         if recipe_ingredients and not ingredients:
-                            ingredients = [clean(ing) for ing in recipe_ingredients if clean(ing)]
+                            ingredients = [clean_ingredient_decimals(clean(ing)) for ing in recipe_ingredients if clean(ing)]
                         
                         # Instructions
                         recipe_instructions = item.get("recipeInstructions", [])
@@ -1169,6 +1218,47 @@ def validate_recipe_quality(recipe_data: dict) -> bool:
     
     return True
 
+def is_article_not_recipe(soup: BeautifulSoup, recipe_data: dict) -> bool:
+    """Detect if this is an article/review rather than a recipe"""
+    title = recipe_data.get("title", "").lower()
+    
+    # Check for article-like titles
+    article_indicators = [
+        "i tried", "we tried", "tested", "review", "compared", "ranking", 
+        "best of", "top ", "most popular", "taste test", "which is better",
+        "vs", "versus", "battle", "showdown", "ultimate guide"
+    ]
+    
+    if any(indicator in title for indicator in article_indicators):
+        return True
+    
+    # Check if ingredients look like article content rather than recipe ingredients
+    ingredients = recipe_data.get("ingredients", [])
+    article_ingredient_indicators = [
+        "average rating:", "stars", "by ", "recipe by", "sandwich by",
+        "classic", "legendary", "make lunch", "dinners", "meals"
+    ]
+    
+    article_like_ingredients = 0
+    for ingredient in ingredients:
+        ingredient_lower = ingredient.lower()
+        if any(indicator in ingredient_lower for indicator in article_ingredient_indicators):
+            article_like_ingredients += 1
+        # Check if ingredient is suspiciously long (likely article text)
+        if len(ingredient) > 100:
+            article_like_ingredients += 1
+    
+    # If more than half the "ingredients" look like article content
+    if len(ingredients) > 0 and article_like_ingredients / len(ingredients) > 0.5:
+        return True
+    
+    # Check for lack of cooking instructions (common in articles)
+    instructions = recipe_data.get("instructions", [])
+    if len(instructions) == 0:
+        return True
+    
+    return False
+
 
 # ---------------- Router ----------------
 @app.post("/api/parseRecipe")
@@ -1194,6 +1284,19 @@ async def parse_recipe(data: RecipeRequest):
             recipe_data = scrape_allrecipes(soup)
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported domain: {domain}")
+
+        # Check if this is an article rather than a recipe
+        if is_article_not_recipe(soup, recipe_data):
+            return {
+                "title": "error",
+                "notes": "This appears to be an article or review, not a recipe. Please provide a direct link to a recipe page.",
+                "ingredients": [],
+                "instructions": [],
+                "cooking_time": None,
+                "servings": "servings not specified",
+                "image_url": None,
+                "rating": None,
+            }
 
         # Return recipe data without image validation
         # (Images are handled by Google Custom Search API in the feed)
