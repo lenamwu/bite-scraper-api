@@ -3,8 +3,6 @@ from pydantic import BaseModel
 from bs4 import BeautifulSoup
 import requests, json, re
 from urllib.parse import urlparse
-import asyncio
-import aiohttp
 
 app = FastAPI()
 
@@ -233,41 +231,92 @@ def scrape_allrecipes(soup: BeautifulSoup) -> dict:
 
     # Extract instructions with improved targeting
     if not instructions:
-        instruction_selectors = [
-            "ol li",  # Ordered list items (most common for instructions)
-            ".recipe-instructions li",
-            ".instructions-section li",
-            ".directions li",
-            ".method li",
-            ".recipe-directions li"
-        ]
+        # Try JSON-LD first for instructions
+        try:
+            for script in soup.find_all("script", type="application/ld+json"):
+                script_text = script.string or script.get_text()
+                if not script_text:
+                    continue
+                
+                try:
+                    data = json.loads(script_text)
+                    candidates = []
+                    
+                    if isinstance(data, dict):
+                        candidates.append(data)
+                        if "@graph" in data and isinstance(data["@graph"], list):
+                            candidates.extend(data["@graph"])
+                    elif isinstance(data, list):
+                        candidates.extend(data)
+                    
+                    for item in candidates:
+                        if not isinstance(item, dict):
+                            continue
+                        
+                        item_type = item.get("@type")
+                        types = [item_type] if isinstance(item_type, str) else (item_type or [])
+                        
+                        if any(str(t).lower() == "recipe" for t in types):
+                            recipe_instructions = item.get("recipeInstructions", [])
+                            if recipe_instructions:
+                                for inst in recipe_instructions:
+                                    if isinstance(inst, str):
+                                        instructions.append(clean(inst))
+                                    elif isinstance(inst, dict):
+                                        text = inst.get("text") or inst.get("name") or ""
+                                        if text:
+                                            instructions.append(clean(text))
+                                break
+                    
+                    if instructions:
+                        break
+                except json.JSONDecodeError:
+                    continue
+        except Exception:
+            pass
         
-        for selector in instruction_selectors:
-            instruction_items = soup.select(selector)
-            potential_instructions = []
+        # If JSON-LD didn't work, try HTML extraction
+        if not instructions:
+            instruction_selectors = [
+                "ol li",  # Ordered list items (most common for instructions)
+                ".recipe-instructions li",
+                ".instructions-section li", 
+                ".directions li",
+                ".method li",
+                ".recipe-directions li",
+                # Try broader selectors for different AllRecipes layouts
+                ".mntl-sc-block-group--OL li",
+                ".comp.mntl-sc-block.mntl-sc-block-startgroup li",
+                "div[data-module*='instruction'] li",
+                "div[data-module*='direction'] li"
+            ]
             
-            for item in instruction_items:
-                text = clean(item.get_text())
-                if not text or len(text) < 10:  # Instructions should be longer
-                    continue
+            for selector in instruction_selectors:
+                instruction_items = soup.select(selector)
+                potential_instructions = []
                 
-                # Skip ingredient-like items and navigation
-                if any(skip_word in text.lower() for skip_word in 
-                       ["cup", "teaspoon", "tablespoon", "ounce", "pound", "recipe", "photo", "view",
-                        "navigation", "menu", "advertisement", "subscribe"]):
-                    continue
+                for item in instruction_items:
+                    text = clean(item.get_text())
+                    if not text or len(text) < 10:  # Instructions should be longer
+                        continue
+                    
+                    # Skip ingredient-like items and navigation
+                    if any(skip_word in text.lower() for skip_word in 
+                           ["cup", "teaspoon", "tablespoon", "ounce", "pound", "recipe", "photo", "view",
+                            "navigation", "menu", "advertisement", "subscribe"]):
+                        continue
+                    
+                    # Look for instruction-like content
+                    if any(action in text.lower() for action in 
+                           ["heat", "cook", "bake", "mix", "stir", "add", "combine", "place", "pour", 
+                            "cover", "simmer", "boil", "fry", "saute", "preheat", "spray", "season",
+                            "whisk", "blend", "chop", "slice", "dice", "melt", "serve", "remove",
+                            "gather", "measure", "soak", "working", "coat"]):
+                        potential_instructions.append(text)
                 
-                # Look for instruction-like content
-                if any(action in text.lower() for action in 
-                       ["heat", "cook", "bake", "mix", "stir", "add", "combine", "place", "pour", 
-                        "cover", "simmer", "boil", "fry", "saute", "preheat", "spray", "season",
-                        "whisk", "blend", "chop", "slice", "dice", "melt", "serve", "remove",
-                        "gather", "measure", "soak", "working"]):
-                    potential_instructions.append(text)
-            
-            if len(potential_instructions) >= 2:  # Need at least 2 instruction steps
-                instructions = potential_instructions
-                break
+                if len(potential_instructions) >= 2:  # Need at least 2 instruction steps
+                    instructions = potential_instructions
+                    break
 
     # Extract timing and servings information
     # Look for recipe details section
@@ -1096,6 +1145,30 @@ def scrape_food_com(soup: BeautifulSoup) -> dict:
         "image_url": image_url,
         "rating": rating,
     }
+
+def validate_recipe_quality(recipe_data: dict) -> bool:
+    """Validate recipe has minimum required data quality"""
+    # Must have title
+    if not recipe_data.get("title") or recipe_data["title"] == "Untitled":
+        return False
+    
+    # Must have at least 3 ingredients
+    ingredients = recipe_data.get("ingredients", [])
+    if len(ingredients) < 3:
+        return False
+    
+    # Must have at least 2 instruction steps
+    instructions = recipe_data.get("instructions", [])
+    if len(instructions) < 2:
+        return False
+    
+    # Must have description/notes
+    notes = recipe_data.get("notes", "")
+    if not notes or len(notes) < 20:
+        return False
+    
+    return True
+
 
 # ---------------- Router ----------------
 @app.post("/api/parseRecipe")
