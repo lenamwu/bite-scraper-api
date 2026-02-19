@@ -109,7 +109,7 @@ async def validate_image_url(image_url: str) -> bool:
         return False
     
     # Test the image URL through your proxy service
-    proxy_url = f"https://recipe-image-proxy.lena-m-wu.workers.dev/?url=={image_url}"
+    proxy_url = f"https://recipe-image-proxy.lena-m-wu.workers.dev/?url={image_url}"
     
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
