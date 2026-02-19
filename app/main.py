@@ -104,12 +104,12 @@ def clean_ingredient_decimals(ingredient: str) -> str:
     return cleaned
 
 async def validate_image_url(image_url: str) -> bool:
-    """Test if an image URL is accessible through the weserv.nl proxy"""
+    """Test if an image URL is accessible through the https://recipe-image-proxy.lena-m-wu.workers.dev/?url= proxy"""
     if not image_url:
         return False
     
     # Test the image URL through your proxy service
-    proxy_url = f"https://images.weserv.nl/?url={image_url}"
+    proxy_url = f"https://recipe-image-proxy.lena-m-wu.workers.dev/?url=={image_url}"
     
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
