@@ -4,6 +4,8 @@ from bs4 import BeautifulSoup
 import requests, json, re
 from urllib.parse import urlparse
 import os
+import random
+from urllib.parse import quote
 
 app = FastAPI()
 
@@ -13,12 +15,16 @@ ALLRECIPES_PROXY = os.getenv("ALLRECIPES_PROXY")
 class RecipeRequest(BaseModel):
     url: str
 
+# list of common desktop user agents to randomize; rotating helps evade basic blocks
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 11_2_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:116.0) Gecko/20100101 Firefox/116.0",
+]
+
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": random.choice(USER_AGENTS),
     "Accept-Language": "en-GB,en;q=0.9",
 }
 
@@ -1272,12 +1278,31 @@ async def parse_recipe(data: RecipeRequest):
         domain = urlparse(url).netloc.lower()
 
         def fetch_page(u: str):
-            """Try to fetch the URL; if ALLRECIPES_PROXY is configured, use it as a HTTP proxy.
-            Return the requests.Response object."""
-            opts = {"headers": HEADERS, "timeout": 25}
+            """Attempt to fetch the given URL.
+            1. Try a direct request with a (possibly random) user agent.
+            2. If that fails and ALLRECIPES_PROXY is defined, retry through that proxy.
+            3. As a last resort try a public CORS proxy (allorigins.win) which often
+               bypasses simple IP blocks.  The returned Response may have a
+               different status code, but the body will contain the target HTML.
+            """
+            # rotate UA for each attempt
+            headers = {**HEADERS, "User-Agent": random.choice(USER_AGENTS)}
+            opts = {"headers": headers, "timeout": 25}
             if ALLRECIPES_PROXY:
                 opts["proxies"] = {"http": ALLRECIPES_PROXY, "https": ALLRECIPES_PROXY}
-            return requests.get(u, **opts)
+                resp = requests.get(u, **opts)
+            else:
+                resp = requests.get(u, **opts)
+
+            # if the response is blocked (402/403/429 etc) and no proxy has been
+            # used yet, try a public proxy service
+            if resp.status_code != 200 and not ALLRECIPES_PROXY:
+                try:
+                    proxy_url = f"https://api.allorigins.win/raw?url={quote(u)}"
+                    resp = requests.get(proxy_url, headers=headers, timeout=25)
+                except Exception:
+                    pass
+            return resp
 
         resp = fetch_page(url)
         if resp.status_code != 200 and ALLRECIPES_PROXY:
