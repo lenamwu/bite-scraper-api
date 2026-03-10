@@ -1336,7 +1336,14 @@ async def parse_recipe(data: RecipeRequest):
 
         # Check if this is an article rather than a recipe
         if is_article_not_recipe(soup, recipe_data):
-            return {
+            # include a snippet of the fetched HTML to help diagnose blocking or
+            # unexpected content (e.g. Cloudflare paywall, article page etc.)
+            snippet = None
+            try:
+                snippet = resp.text[:500].replace("\n", " ")
+            except Exception:
+                snippet = None
+            result = {
                 "title": "error",
                 "notes": "This appears to be an article or review, not a recipe. Please provide a direct link to a recipe page.",
                 "ingredients": [],
@@ -1346,6 +1353,9 @@ async def parse_recipe(data: RecipeRequest):
                 "image_url": None,
                 "rating": None,
             }
+            if snippet:
+                result["debug_html"] = snippet
+            return result
 
         # Return recipe data without image validation
         # (Images are handled by Google Custom Search API in the feed)
