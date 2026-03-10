@@ -3,8 +3,12 @@ from pydantic import BaseModel
 from bs4 import BeautifulSoup
 import requests, json, re
 from urllib.parse import urlparse
+import os
 
 app = FastAPI()
+
+# optional proxy for AllRecipes fetches (https://example.com/proxy)
+ALLRECIPES_PROXY = os.getenv("ALLRECIPES_PROXY")
 
 class RecipeRequest(BaseModel):
     url: str
@@ -1267,9 +1271,29 @@ async def parse_recipe(data: RecipeRequest):
         url = data.url if data.url.startswith("http") else f"https://{data.url}"
         domain = urlparse(url).netloc.lower()
 
-        resp = requests.get(url, headers=HEADERS, timeout=25)
+        def fetch_page(u: str):
+            """Try to fetch the URL; if ALLRECIPES_PROXY is configured, use it as a HTTP proxy.
+            Return the requests.Response object."""
+            opts = {"headers": HEADERS, "timeout": 25}
+            if ALLRECIPES_PROXY:
+                opts["proxies"] = {"http": ALLRECIPES_PROXY, "https": ALLRECIPES_PROXY}
+            return requests.get(u, **opts)
+
+        resp = fetch_page(url)
+        if resp.status_code != 200 and ALLRECIPES_PROXY:
+            # maybe the proxy itself failed, try again without it
+            resp = fetch_page(url)
+
         if resp.status_code != 200:
-            raise HTTPException(status_code=404, detail="Recipe page not found")
+            # provide more context for debugging external fetch issues
+            detail = f"Recipe page not found (status {resp.status_code})"
+            try:
+                body_snippet = resp.text[:200].strip().replace("\n", " ")
+                if body_snippet:
+                    detail += f" -- {body_snippet}"
+            except Exception:
+                pass
+            raise HTTPException(status_code=404, detail=detail)
 
         soup = BeautifulSoup(resp.content, "html.parser")
 
