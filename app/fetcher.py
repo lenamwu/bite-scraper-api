@@ -1,4 +1,4 @@
-"""HTTP fetching with User-Agent rotation and Cloudflare bypass."""
+"""HTTP fetching with TLS fingerprint impersonation for Cloudflare bypass."""
 
 from __future__ import annotations
 
@@ -6,74 +6,72 @@ import os
 import random
 from urllib.parse import quote
 
-import cloudscraper
+from curl_cffi import requests as cf_requests
 import requests
 
 ALLRECIPES_PROXY = os.getenv("ALLRECIPES_PROXY")
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 11_2_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:116.0) Gecko/20100101 Firefox/116.0",
-]
-
-# Shared cloudscraper instance — handles Cloudflare JS challenges automatically
-_scraper = cloudscraper.create_scraper()
+# Browser identities for curl_cffi to impersonate (TLS fingerprint + headers)
+_IMPERSONATE_TARGETS = ["chrome", "chrome110", "edge99"]
 
 
-def _random_headers() -> dict:
-    return {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
+def _has_recipe_data(text: str) -> bool:
+    """Quick check that a response actually contains recipe structured data,
+    not a Cloudflare challenge page masquerading as a 200."""
+    return "recipeIngredient" in text or "recipeInstructions" in text or "<h1" in text
 
 
 def fetch_page(url: str) -> requests.Response:
-    """Fetch *url*, bypassing Cloudflare challenges when needed.
+    """Fetch *url*, bypassing Cloudflare with TLS fingerprint impersonation.
 
     Strategy:
-    1. Try cloudscraper (handles Cloudflare JS challenges).
-    2. If that fails and ALLRECIPES_PROXY is set, retry through the proxy.
-    3. As a last resort, try a public CORS proxy (allorigins.win).
+    1. curl_cffi with Chrome impersonation (best Cloudflare bypass).
+    2. If that returns a challenge page, try a different impersonation target.
+    3. If ALLRECIPES_PROXY is set, try through the proxy.
+    4. Last resort: public CORS proxy.
     """
-    headers = _random_headers()
+    # --- Primary: curl_cffi with browser impersonation ---
+    last_resp = None
+    for target in _IMPERSONATE_TARGETS:
+        try:
+            resp = cf_requests.get(url, impersonate=target, timeout=25)
+            # curl_cffi returns its own Response; convert key fields so callers
+            # can treat it like a requests.Response
+            if resp.status_code == 200 and _has_recipe_data(resp.text):
+                return resp
+            last_resp = resp
+        except Exception:
+            continue
 
-    # cloudscraper handles Cloudflare automatically
-    try:
-        resp = _scraper.get(url, headers=headers, timeout=25)
-        if resp.status_code == 200:
-            return resp
-    except Exception:
-        resp = None
-
-    # If cloudscraper didn't get a 200, try with private proxy
+    # --- Fallback: private proxy ---
     if ALLRECIPES_PROXY:
         try:
             resp = requests.get(
                 url,
-                headers=_random_headers(),
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
                 proxies={"http": ALLRECIPES_PROXY, "https": ALLRECIPES_PROXY},
                 timeout=25,
             )
             if resp.status_code == 200:
                 return resp
+            last_resp = last_resp or resp
         except Exception:
             pass
 
-    # Last resort: public CORS proxy
-    if resp is None or resp.status_code != 200:
-        try:
-            proxy_url = f"https://api.allorigins.win/raw?url={quote(url)}"
-            fallback = requests.get(proxy_url, headers=_random_headers(), timeout=25)
-            if fallback.status_code == 200:
-                return fallback
-        except Exception:
-            pass
+    # --- Last resort: public CORS proxy ---
+    try:
+        proxy_url = f"https://api.allorigins.win/raw?url={quote(url)}"
+        resp = requests.get(proxy_url, timeout=25)
+        if resp.status_code == 200:
+            return resp
+        last_resp = last_resp or resp
+    except Exception:
+        pass
 
-    # Return whatever we got (may be an error response)
-    if resp is not None:
-        return resp
-    # If everything failed with exceptions, create a minimal error response
+    if last_resp is not None:
+        return last_resp
     raise ConnectionError(f"All fetch methods failed for {url}")
