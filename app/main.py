@@ -9,6 +9,8 @@ from app.parsers.allrecipes import scrape_allrecipes
 from app.parsers.foodnetwork import scrape_foodnetwork_uk
 from app.parsers.tableofspice import scrape_tableofspice
 from app.parsers.food_com import scrape_food_com
+from app.parsers.recipetineats import scrape_recipetineats
+from app.parsers.gimmesomeoven import scrape_gimmesomeoven
 
 app = FastAPI()
 
@@ -23,6 +25,8 @@ _SCRAPERS = {
     "food.com": scrape_food_com,
     "thetableofspice.com": scrape_tableofspice,
     "allrecipes.com": scrape_allrecipes,
+    "recipetineats.com": scrape_recipetineats,
+    "gimmesomeoven.com": scrape_gimmesomeoven,
 }
 
 
