@@ -99,7 +99,7 @@ def extract_jsonld_recipe(soup: BeautifulSoup) -> dict:
         if not txt:
             continue
         try:
-            data = json.loads(txt)
+            data = json.loads(txt, strict=False)
         except (json.JSONDecodeError, ValueError):
             continue
 
